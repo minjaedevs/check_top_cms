@@ -97,8 +97,14 @@ function resolveTakeover(
 }
 
 function clearTakeoverForCid(cid: string): void {
-  for (const key of takeoverMap.keys()) {
-    if (key.startsWith(`${cid}:`)) takeoverMap.delete(key);
+  for (const [key, val] of takeoverMap) {
+    // Remove entries where cid is the ORIGINAL connection (key prefix)
+    // OR where cid is the REPLACEMENT connection (val.newCid).
+    // Without the second clause, a disconnecting replacement leaves stale
+    // routing entries that keep pointing events at a dead WS connection.
+    if (key.startsWith(`${cid}:`) || val.newCid === cid) {
+      takeoverMap.delete(key);
+    }
   }
 }
 
@@ -189,7 +195,7 @@ function fireDeviceTimeout(cid: string, deviceId: string): void {
   const fallback = samePoolIdle ?? store.findIdleDeviceExcept(cid)?.device ?? null;
   const fallbackCid = samePoolIdle ? cid : (store.findIdleDeviceExcept(cid)?.connectionId ?? null);
 
-  if (fallback && fallbackCid && ws) {
+  if (fallback && fallbackCid) {
     const frame = JSON.stringify({
       event: "BatchReassignFallback",
       target: "BatchReassignFallback",
@@ -202,7 +208,15 @@ function fireDeviceTimeout(cid: string, deviceId: string): void {
         reason: "device_timeout",
       },
     }) + "\u001e";
-    try { ws.send(frame); } catch { /* ignore */ }
+    // Route to the connection that OWNS the fallback device so the correct
+    // Python client (the one managing that device) handles the reassignment.
+    // Falls back to original WS only when the other session is unavailable.
+    const otherWs = fallbackCid !== cid
+      ? (store.sessions.get(fallbackCid)?.ws as unknown as import("hono/ws").WSContext | undefined)
+      : undefined;
+    const targetWs = otherWs ?? ws;
+    if (!targetWs) return; // both sessions gone — nothing to send
+    try { targetWs.send(frame); } catch { /* ignore */ }
     store.pushLog({
       ts: Date.now(), connectionId: cid, deviceId,
       jobId: device.jobId, batchId: device.batchId,
