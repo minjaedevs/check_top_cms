@@ -11,7 +11,7 @@
 1. [Kiến trúc tổng quan](#1-kiến-trúc-tổng-quan)
 2. [Giao thức SignalR JSON v1](#2-giao-thức-signalr-json-v1)
 3. [Events C→S (App → Server)](#3-events-cs-app--server)
-4. [Events S→C (Server → App)](#4-events-sc-server--app)
+4. [Events S→C (Server → App)](#4-events-sc-server--app) — RetryBatch · BatchReassignFallback · QueryEligibleDevice · ForceReassignDevice · poll_device_status
 5. [Messages S→FE (Server → Dashboard)](#5-messages-sfe-server--dashboard)
 6. [Luồng chạy bình thường (Happy path)](#6-luồng-chạy-bình-thường-happy-path)
 7. [TH2a — Keyword retry](#7-th2a--keyword-retry)
@@ -639,7 +639,7 @@ Gửi đến WS của pool chứa thiết bị thay thế (có thể là pool kh
 
 ### 4.4 `ForceReassignDevice`
 
-**Khi nào:** TH-B1 — không client nào có device eligible (DK1/2/3 fail), nhưng pool gốc (pool của device bị fail) **vẫn còn device khác không offline**. Server yêu cầu client đó bắt buộc chọn device bất kỳ (bỏ qua DK).
+**Khi nào:** TH-B1 — không client nào có device eligible (DK1/2/3 fail hết), nhưng pool gốc (pool của device bị fail) **vẫn còn device khác không offline**. Server yêu cầu client đó bắt buộc chọn device bất kỳ (bỏ qua DK).
 
 ```json
 {
@@ -678,6 +678,30 @@ Gửi đến WS của pool chứa thiết bị thay thế (có thể là pool kh
 1. Chọn device đầu tiên available (không phải `originalDeviceId`, không offline) — bỏ qua DK
 2. Reassign các queued job của `originalDeviceId` cho device đó
 3. Gửi `BatchDeviceError(REASSIGNED, deviceId_new=<force_serial>)` về server để server log + update state
+
+---
+
+### 4.5 `poll_device_status`
+
+**Khi nào:** Server chủ động hỏi app để lấy trạng thái mới nhất của tất cả device.
+Gửi mỗi **30 giây** kể từ khi app kết nối (`DEVICE_POLL_INTERVAL_MS = 30_000`).
+Mục đích: giữ FE dashboard đồng bộ ngay cả khi không có job nào đang chạy (app có thể miss ADB transition).
+
+```json
+{
+  "event": "poll_device_status",
+  "target": "poll_device_status",
+  "payload": {
+    "requestedAt": 1700000000000
+  }
+}
+```
+
+**App nhận:** Gửi lại `device_status` event cho từng device đang quản lý.
+Mỗi `device_status` chạy qua `onDeviceStatus` handler bình thường → store → FE broadcast.
+
+> **Lưu ý:** Đây là **server-initiated** poll, không phải response của một request cụ thể.
+> App gửi nhiều `device_status` event riêng lẻ (1 per device), không có response frame chung.
 
 ---
 
@@ -1110,8 +1134,19 @@ QueryEligibleDevice → tất cả client khác (3s timeout)
 **Clear khi:** `BatchDeviceError` hoặc `device_fail_recovery_cancel`
 
 **Khi timeout (`fireRecoveryFallback`):**
-- Logic giống hệt `onBatchDeviceError` NO_ELIGIBLE_DEVICE branch
-- Push log `recovery_watchdog_timeout` trước khi xử lý fallback
+
+> **Quan trọng:** `fireRecoveryFallback` dùng luồng **cũ** (BatchReassignFallback trực tiếp), KHÔNG dùng QueryEligibleDevice mới. Lý do: đây là trường hợp app crash/hang — không thể tin tưởng app sẽ xử lý QueryEligibleDevice → EligibleDeviceResponse.
+
+1. Push log `recovery_watchdog_timeout`
+2. Tìm idle device ở pool **khác** (`store.findIdleDeviceExcept(cid)`)
+   - Nếu có → gửi `BatchReassignFallback(reason="recovery_watchdog")` đến WS của pool đó
+   - Mark device gốc → `offline`, mark replacement → `processing`
+   - Push log `recovery_watchdog_reassigned` + `takeover_reassigned`
+3. Nếu không có pool khác → tìm device non-offline **cùng pool** (force)
+   - Gửi `BatchReassignFallback(force=true, reason="recovery_watchdog")` về pool gốc
+   - Mark device gốc → `offline`, mark replacement → `processing`
+   - Push log `recovery_watchdog_force_fallback` + `takeover_reassigned`
+4. Không có device nào → Push alert `no_device_globally`
 
 ---
 
@@ -1210,6 +1245,13 @@ Device {
 
 // Module-level trong app-ws.ts (không phải trong Store)
 pendingQueries: Map<queryId, PendingQuery>   // TH2b QueryEligibleDevice collector
+
+takeoverMap: Map<"origCid:origDeviceId", { newCid, newDeviceId }>
+// Khi device B thay thế A, các event sau đó (step_change, SubmitMobileResult,
+// job_success/failed) vẫn đến với deviceId=A.
+// takeoverMap redirect chúng về device B để FE hiển thị log đúng cột.
+// Set khi: onBatchDeviceError(REASSIGNED), fireDeviceTimeout, fireRecoveryFallback
+// Clear khi: onJobSuccess, onJobFailed (delete entry gốc), clearTakeoverForCid (khi WS đóng)
 
 PendingQuery {
   cid:            string            // connectionId của client báo NO_ELIGIBLE_DEVICE
