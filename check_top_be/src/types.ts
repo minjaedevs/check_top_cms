@@ -245,9 +245,35 @@ export interface DeviceFailRecoveryStartPayload {
   windowMs?: number;     // hint: how long app will wait (default 30 000)
 }
 
+// ─── TH2b cross-PC forwarding types ─────────────────────────────────────────
+
+/** A single keyword item in CheckKeywords format (for cross-PC forwarding). */
+export interface KhuItem {
+  requestId: string;
+  keyword: string;
+  proxy: string[];
+  country: number;
+  departmentId: string;
+  departmentName: string;
+  deviceId: null;
+}
+
+/** Full khu data (all keywords) for cross-PC forwarding. */
+export interface KhuData {
+  departmentId: string;
+  departmentName: string;
+  items: KhuItem[];
+}
+
 /**
- * BatchDeviceError (proposed C→S event for TH2b)
+ * BatchDeviceError (C→S event for TH2b)
  * App sends: { payload:{ deviceId, sessionId, batchId, status, deviceId_new? } }
+ *
+ * status=REASSIGNED:         client handled internally — server logs only
+ * status=NO_ELIGIBLE_DEVICE: client found no eligible device — server takes over
+ *   → remainingItems: partial remaining keywords of current khu (for ForceReassignDevice)
+ *   → allKhus: full keyword data for ALL khus device was responsible for (for cross-PC)
+ *   → currentDeptId: department_id of the currently running khu
  */
 export interface BatchDeviceErrorPayload {
   deviceId: string;
@@ -256,6 +282,46 @@ export interface BatchDeviceErrorPayload {
   status: "REASSIGNED" | "NO_ELIGIBLE_DEVICE";
   deviceId_new?: string;    // set when status=REASSIGNED
   error?: string;
+  // NO_ELIGIBLE_DEVICE fields:
+  currentDeptId?: string;      // department_id of the currently running khu
+  remainingItems?: KhuItem[];  // partial remaining of current khu (for ForceReassignDevice same-PC)
+  allKhus?: KhuData[];         // full khu data for ALL khus (for cross-PC CheckKeywords)
+}
+
+/**
+ * QueryEligibleDevice (S→C) — server asks other clients for eligible device.
+ * Client runs DK1/2/3 locally and responds with EligibleDeviceResponse.
+ */
+export interface QueryEligibleDevicePayload {
+  queryId: string;
+  departmentId: string;   // khu that needs handling
+  remainingCount: number; // how many keywords remain (for DK3)
+  sessionId?: string;
+}
+
+/**
+ * EligibleDeviceResponse (C→S) — client responds to QueryEligibleDevice.
+ */
+export interface EligibleDeviceResponsePayload {
+  queryId: string;
+  eligible: boolean;
+  deviceId?: string;  // which device is eligible (if any)
+}
+
+/**
+ * ForceReassignDevice (S→C) — server tells same-pool client to force-assign
+ * remaining keywords to any available device (ignores DK conditions).
+ * Only sends remainingItems of the CURRENT khu (not pending khus — they are
+ * still in the client's internal queue).
+ */
+export interface ForceReassignDevicePayload {
+  queryId: string;
+  originalDeviceId: string;
+  departmentId: string;
+  departmentName: string;
+  sessionId?: string;
+  batchId?: string;
+  remainingItems: KhuItem[];
 }
 
 // ─── Dashboard WS messages (S→FE) ────────────────────────────────────────────

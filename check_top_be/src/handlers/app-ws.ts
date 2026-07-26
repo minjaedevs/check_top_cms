@@ -37,6 +37,11 @@ import type {
   JobSuccessPayload,
   BatchDeviceErrorPayload,
   DeviceFailRecoveryStartPayload,
+  KhuData,
+  KhuItem,
+  QueryEligibleDevicePayload,
+  EligibleDeviceResponsePayload,
+  ForceReassignDevicePayload,
 } from "../types";
 
 export const { upgradeWebSocket, websocket } = createBunWebSocket();
@@ -72,6 +77,151 @@ function clearAllRecoveryForCid(cid: string): void {
   for (const [key, t] of recoveryMap) {
     if (key.startsWith(`${cid}:`)) { clearTimeout(t); recoveryMap.delete(key); }
   }
+}
+
+// ── TH2b: QueryEligibleDevice response collector ──────────────────────────────
+// Server broadcasts QueryEligibleDevice to all other clients, collects responses
+// within a 3s window, then routes keywords to the best eligible client.
+
+const QUERY_TIMEOUT_MS = 3_000;
+
+interface PendingQuery {
+  cid:             string;         // failing client's connectionId
+  ws:              WSContext;      // failing client's WebSocket
+  deviceId:        string;         // failed device serial
+  sessionId:       string | null;
+  batchId:         string | null;
+  currentDeptId:   string;         // current running department
+  remainingItems:  KhuItem[];      // partial remaining of current khu
+  allKhus:         KhuData[];      // full khu data for all khus (cross-PC)
+  expectedCount:   number;         // number of other clients queried
+  responses:       Array<{ connectionId: string; eligible: boolean; deviceId?: string }>;
+  timer:           ReturnType<typeof setTimeout>;
+}
+
+const pendingQueries = new Map<string, PendingQuery>();
+
+function buildCheckKeywordsForKhus(
+  allKhus: KhuData[],
+  targetDeviceId: string,
+  sessionId: string
+): string {
+  const allItems: KhuItem[] = allKhus.flatMap((k) => k.items);
+  return (
+    JSON.stringify({
+      type: 1,
+      target: "CheckKeywords",
+      sessionId,
+      arguments: [allItems, { deviceId: targetDeviceId, targetDeviceId, sessionId }],
+    }) + "\u001e"
+  );
+}
+
+function processQueryResult(q: PendingQuery): void {
+  // TH A: any eligible client found
+  const eligible = q.responses.find((r) => r.eligible);
+  if (eligible && q.allKhus.length > 0) {
+    const otherSession = store.sessions.get(eligible.connectionId);
+    const otherWs = otherSession?.ws as unknown as WSContext | undefined;
+    if (otherWs) {
+      // Pick the device they nominated, or first non-offline device in their pool
+      const otherPool = store.pools.get(eligible.connectionId);
+      const targetDevice =
+        eligible.deviceId ||
+        [...(otherPool?.devices.values() ?? [])].find((d) => d.status !== "offline")?.deviceId ||
+        "";
+      const sessionId = `SESS-TH2B-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+      const frame = buildCheckKeywordsForKhus(q.allKhus, targetDevice, sessionId);
+      try { otherWs.send(frame); } catch { /* ignore */ }
+      store.pushLog({
+        ts: Date.now(), connectionId: eligible.connectionId, deviceId: targetDevice || "-",
+        jobId: sessionId, batchId: null,
+        step: "th2b_cross_pool_eligible", status: "running",
+        detail: `TH2b: ${q.allKhus.length} khu(s) from failed device=${q.deviceId} (eligible via DK)`,
+      });
+      store.pushLog({
+        ts: Date.now(), connectionId: q.cid, deviceId: q.deviceId,
+        jobId: q.sessionId, batchId: q.batchId,
+        step: "th2b_routed_cross_pool", status: "running",
+        detail: `Routed → cid=${eligible.connectionId} device=${targetDevice || "-"}`,
+      });
+      console.log(`[TH2b] QueryResult TH-A: CheckKeywords → cid=${eligible.connectionId} device=${targetDevice}`);
+      return;
+    }
+  }
+
+  // TH B: no eligible — check failing client's pool first
+  const pool = store.pools.get(q.cid);
+  const otherDevices = pool
+    ? [...pool.devices.values()].filter((d) => d.deviceId !== q.deviceId && d.status !== "offline")
+    : [];
+
+  if (otherDevices.length > 0) {
+    // TH B1: same pool still has devices → ForceReassignDevice (partial current khu only)
+    const forceFrame = JSON.stringify({
+      event: "ForceReassignDevice",
+      target: "ForceReassignDevice",
+      payload: {
+        queryId: `force_${Date.now()}`,
+        originalDeviceId: q.deviceId,
+        sessionId: q.sessionId,
+        batchId: q.batchId,
+        departmentId: q.currentDeptId,
+        departmentName: q.remainingItems[0]?.departmentName ?? "",
+        remainingItems: q.remainingItems,
+      } satisfies ForceReassignDevicePayload,
+    }) + "\u001e";
+    try { q.ws.send(forceFrame); } catch { /* ignore */ }
+    store.pushLog({
+      ts: Date.now(), connectionId: q.cid, deviceId: q.deviceId,
+      jobId: q.sessionId, batchId: q.batchId,
+      step: "th2b_force_reassign", status: "running",
+      detail: `ForceReassignDevice → same pool (remainingItems=${q.remainingItems.length})`,
+    });
+    console.log(`[TH2b] QueryResult TH-B1: ForceReassignDevice → cid=${q.cid}`);
+    return;
+  }
+
+  // TH B2: failing client has 0 devices → any other client with devices (full khus)
+  if (q.allKhus.length > 0) {
+    for (const [otherCid, otherPool] of store.pools) {
+      if (otherCid === q.cid) continue;
+      const anyDevice = [...otherPool.devices.values()].find((d) => d.status !== "offline");
+      if (!anyDevice) continue;
+      const otherSession = store.sessions.get(otherCid);
+      const otherWs2 = otherSession?.ws as unknown as WSContext | undefined;
+      if (!otherWs2) continue;
+      const sessionId = `SESS-TH2B-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+      const frame = buildCheckKeywordsForKhus(q.allKhus, anyDevice.deviceId, sessionId);
+      try { otherWs2.send(frame); } catch { /* ignore */ }
+      store.pushLog({
+        ts: Date.now(), connectionId: otherCid, deviceId: anyDevice.deviceId,
+        jobId: sessionId, batchId: null,
+        step: "th2b_cross_pool_force", status: "running",
+        detail: `TH2b B2: full khus from ${q.deviceId} (cid=${q.cid} had 0 devices)`,
+      });
+      store.pushLog({
+        ts: Date.now(), connectionId: q.cid, deviceId: q.deviceId,
+        jobId: q.sessionId, batchId: q.batchId,
+        step: "th2b_routed_cross_pool_force", status: "running",
+        detail: `B2: routed all khus → cid=${otherCid} device=${anyDevice.deviceId}`,
+      });
+      console.log(`[TH2b] QueryResult TH-B2: CheckKeywords(all khus) → cid=${otherCid} device=${anyDevice.deviceId}`);
+      return;
+    }
+  }
+
+  // Priority 3: no device anywhere
+  store.broadcastDash({
+    type: "step_log",
+    data: {
+      ts: Date.now(), connectionId: q.cid, deviceId: q.deviceId,
+      jobId: q.sessionId, batchId: q.batchId,
+      step: "no_device_globally", status: "failed",
+      detail: `ALERT — no device globally for TH2b. session=${q.sessionId ?? "-"}`,
+    },
+  });
+  console.warn(`[TH2b] QueryResult: no device anywhere cid=${q.cid} device=${q.deviceId}`);
 }
 
 // ── TH2b device takeover map ──────────────────────────────────────────────────
@@ -352,6 +502,8 @@ function handleEvent(
       return onRecoveringDone(cid, payload as { deviceId: string });
     case "BatchDeviceError":
       return onBatchDeviceError(cid, ws, payload as unknown as BatchDeviceErrorPayload);
+    case "EligibleDeviceResponse":
+      return onEligibleDeviceResponse(cid, payload as unknown as EligibleDeviceResponsePayload);
     case "device_fail_recovery_start":
       return onDeviceFailRecoveryStart(cid, ws, payload as unknown as DeviceFailRecoveryStartPayload);
     case "device_fail_recovery_cancel": {
@@ -793,13 +945,22 @@ function onRecoveringDone(cid: string, p: { deviceId: string }): void {
 }
 
 /**
- * BatchDeviceError (TH2b — proposed event)
- * App payload: { deviceId, sessionId, batchId, status:"REASSIGNED"|"NO_ELIGIBLE_DEVICE", deviceId_new? }
+ * BatchDeviceError (TH2b — C→S)
  *
- * REASSIGNED:         client already handled it — server logs only
- * NO_ELIGIBLE_DEVICE: server checks global pool:
- *   - Idle device found: send BatchReassignFallback → client uses it (no conditions)
- *   - No device at all: Telegram alert
+ * status=REASSIGNED:
+ *   Client handled internally — server logs and updates device states.
+ *   Also used after ForceReassignDevice when client picks a replacement.
+ *
+ * status=NO_ELIGIBLE_DEVICE:
+ *   Client could not find an eligible device (DK1/2/3 all failed).
+ *   Server:
+ *     1. Mark original device offline.
+ *     2. Broadcast QueryEligibleDevice to ALL other clients.
+ *     3. Collect EligibleDeviceResponse (3s timeout).
+ *     4a. TH-A: eligible found → CheckKeywords(allKhus) → that client (full khus, cross-PC).
+ *     4b. TH-B1: none eligible, same pool still has devices → ForceReassignDevice(remainingItems).
+ *     4c. TH-B2: same pool empty → any other pool → CheckKeywords(allKhus).
+ *     4d. Nothing → alert.
  */
 function onBatchDeviceError(
   cid: string,
@@ -813,15 +974,14 @@ function onBatchDeviceError(
     ts: Date.now(), connectionId: cid, deviceId: p.deviceId,
     jobId: p.sessionId ?? null, batchId: p.batchId ?? null,
     step: "batch_device_error", status: "failed",
-    detail: `status=${p.status}${p.deviceId_new ? ` new=${p.deviceId_new}` : ""}`,
+    detail: `status=${p.status}${p.deviceId_new ? ` new=${p.deviceId_new}` : ""}${p.currentDeptId ? ` dept=${p.currentDeptId}` : ""}`,
   });
 
+  // ── REASSIGNED (internal or force-reassign result) ────────────────────────
   if (p.status === "REASSIGNED") {
     console.log(`[app-ws] TH2b REASSIGNED device=${p.deviceId} → ${p.deviceId_new ?? "-"} cid=${cid}`);
-    // Mark original device offline — job handed to another device, no longer serving
     const origDev = store.getDevice(cid, p.deviceId);
     store.updateDeviceStatus(cid, p.deviceId, { status: "offline", jobId: null, batchId: null });
-    // Push takeover log for replacement device (same pool only)
     if (p.deviceId_new) {
       setTakeover(cid, p.deviceId, cid, p.deviceId_new);
       store.updateDeviceStatus(cid, p.deviceId_new, {
@@ -837,110 +997,116 @@ function onBatchDeviceError(
     return;
   }
 
-  // NO_ELIGIBLE_DEVICE — server looks for a fallback:
-  //   1. Idle device in ANOTHER connection → send BatchReassignFallback to THAT connection's ws
-  //   2. No other connection → send BatchReassignFallback BACK to original connection
-  //      with any non-offline device (let client use it unconditionally)
-  //   3. Nothing at all → Telegram alert
+  // ── NO_ELIGIBLE_DEVICE ────────────────────────────────────────────────────
 
-  const found = store.findIdleDeviceExcept(cid);
-  if (found) {
-    // Route to the other pool's connection so that pool handles the fallback
-    const otherSession = store.sessions.get(found.connectionId);
-    const otherWs = otherSession?.ws as unknown as import("hono/ws").WSContext | undefined;
-    const frame = JSON.stringify({
-      event: "BatchReassignFallback",
-      target: "BatchReassignFallback",
-      payload: {
-        originalDeviceId: p.deviceId,
-        fallbackDeviceId: found.device.deviceId,
-        fallbackConnectionId: found.connectionId,
-        sessionId: p.sessionId,
-        batchId: p.batchId,
-      },
-    }) + "\u001e";
-    if (otherWs) {
-      try { otherWs.send(frame); } catch { /* ignore */ }
-      console.log(`[app-ws] TH2b BatchReassignFallback → cid=${found.connectionId} device=${found.device.deviceId}`);
-    } else {
-      // Other session ws not available — fall back to original connection
-      try { ws.send(frame); } catch { /* ignore */ }
-      console.log(`[app-ws] TH2b BatchReassignFallback (other ws unavailable) → original cid=${cid}`);
-    }
-    // Mark original device offline — job handed to replacement
-    const origDev1 = store.getDevice(cid, p.deviceId);
-    setTakeover(cid, p.deviceId, found.connectionId, found.device.deviceId);
-    store.updateDeviceStatus(cid, p.deviceId, { status: "offline", jobId: null, batchId: null });
-    // Mark replacement device processing + push takeover log
-    store.updateDeviceStatus(found.connectionId, found.device.deviceId, {
-      status: "processing", jobId: p.sessionId ?? null, batchId: p.batchId ?? null,
-    });
-    store.pushLog({
-      ts: Date.now(), connectionId: found.connectionId, deviceId: found.device.deviceId,
-      jobId: p.sessionId ?? null, batchId: p.batchId ?? null,
-      step: "takeover_reassigned", status: "running",
-      detail: `Chạy thay ${origDev1?.name ?? p.deviceId}`,
+  const remainingItems: KhuItem[] = p.remainingItems ?? [];
+  const allKhus: KhuData[]        = p.allKhus ?? [];
+  const currentDeptId              = p.currentDeptId ?? remainingItems[0]?.departmentId ?? "";
+
+  // Mark original device offline immediately
+  store.updateDeviceStatus(cid, p.deviceId, { status: "offline", jobId: null, batchId: null });
+  store.pushLog({
+    ts: Date.now(), connectionId: cid, deviceId: p.deviceId,
+    jobId: p.sessionId ?? null, batchId: p.batchId ?? null,
+    step: "th2b_no_eligible_device", status: "failed",
+    detail: `Client found no eligible device. remainingItems=${remainingItems.length} khus=${allKhus.length} dept=${currentDeptId}`,
+  });
+
+  // Find all other connections to query
+  const otherCids = [...store.sessions.keys()].filter((c) => c !== cid);
+
+  if (otherCids.length === 0) {
+    // No other clients → immediate fallback (same pool or drop)
+    console.log(`[TH2b] NO_ELIGIBLE_DEVICE: no other clients — immediate fallback cid=${cid}`);
+    processQueryResult({
+      cid, ws, deviceId: p.deviceId,
+      sessionId: p.sessionId ?? null, batchId: p.batchId ?? null,
+      currentDeptId, remainingItems, allKhus,
+      expectedCount: 0, responses: [],
+      timer: setTimeout(() => {}, 0), // dummy timer (already processed)
     });
     return;
   }
 
-  // No idle device in any other connection.
-  // Find any non-offline device in the SAME pool (ignore its current workload).
-  // Client receives this and uses the fallback device unconditionally.
-  const pool = store.pools.get(cid);
-  const anyActive = pool
-    ? [...pool.devices.values()].find(
-        (d) => d.deviceId !== p.deviceId && d.status !== "offline"
-      )
-    : null;
+  // Build queryId and broadcast to all other clients
+  const queryId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const queryPayload: QueryEligibleDevicePayload = {
+    queryId,
+    departmentId: currentDeptId,
+    remainingCount: remainingItems.length,
+    sessionId: p.sessionId ?? undefined,
+  };
+  const queryFrame = JSON.stringify({
+    event: "QueryEligibleDevice",
+    target: "QueryEligibleDevice",
+    payload: queryPayload,
+  }) + "\u001e";
 
-  if (anyActive) {
-    const frame = JSON.stringify({
-      event: "BatchReassignFallback",
-      target: "BatchReassignFallback",
-      payload: {
-        originalDeviceId: p.deviceId,
-        fallbackDeviceId: anyActive.deviceId,
-        fallbackConnectionId: cid,
-        sessionId: p.sessionId,
-        batchId: p.batchId,
-        force: true, // client must use this device regardless of current status
-      },
-    }) + "\u001e";
-    try { ws.send(frame); } catch { /* ignore */ }
-    // Mark original device offline
-    const origDev2 = store.getDevice(cid, p.deviceId);
-    setTakeover(cid, p.deviceId, cid, anyActive.deviceId);
-    store.updateDeviceStatus(cid, p.deviceId, { status: "offline", jobId: null, batchId: null });
-    // Mark replacement processing + push takeover log for replacement device column
-    store.updateDeviceStatus(cid, anyActive.deviceId, {
-      status: "processing", jobId: p.sessionId ?? null, batchId: p.batchId ?? null,
+  let queried = 0;
+  for (const otherCid of otherCids) {
+    const otherSession = store.sessions.get(otherCid);
+    const otherWs = otherSession?.ws as unknown as WSContext | undefined;
+    if (!otherWs) continue;
+    try { otherWs.send(queryFrame); queried++; } catch { /* ignore */ }
+  }
+
+  console.log(`[TH2b] QueryEligibleDevice queryId=${queryId} sent to ${queried} client(s)`);
+
+  if (queried === 0) {
+    // No reachable clients — immediate fallback
+    processQueryResult({
+      cid, ws, deviceId: p.deviceId,
+      sessionId: p.sessionId ?? null, batchId: p.batchId ?? null,
+      currentDeptId, remainingItems, allKhus,
+      expectedCount: 0, responses: [],
+      timer: setTimeout(() => {}, 0),
     });
-    store.pushLog({
-      ts: Date.now(), connectionId: cid, deviceId: anyActive.deviceId,
-      jobId: p.sessionId ?? null, batchId: p.batchId ?? null,
-      step: "takeover_reassigned", status: "running",
-      detail: `Chạy thay ${origDev2?.name ?? p.deviceId}`,
-    });
-    store.pushLog({
-      ts: Date.now(), connectionId: cid, deviceId: p.deviceId,
-      jobId: p.sessionId ?? null, batchId: p.batchId ?? null,
-      step: "batch_reassign_fallback_same_pool", status: "running",
-      detail: `Fallback → ${anyActive.deviceId} (force, same pool)`,
-    });
-    console.log(`[app-ws] TH2b BatchReassignFallback same-pool force → ${anyActive.deviceId} cid=${cid}`);
-  } else {
-    // No device anywhere — alert
-    store.broadcastDash({
-      type: "step_log",
-      data: {
-        ts: Date.now(), connectionId: cid, deviceId: p.deviceId,
-        jobId: p.sessionId ?? null, batchId: p.batchId ?? null,
-        step: "no_device_globally", status: "failed",
-        detail: `ALERT Telegram — no active device globally. session=${p.sessionId ?? "-"}`,
-      },
-    });
-    console.warn(`[app-ws] TH2b no active device globally cid=${cid}`);
+    return;
+  }
+
+  const timer = setTimeout(() => {
+    const q = pendingQueries.get(queryId);
+    if (!q) return;
+    pendingQueries.delete(queryId);
+    console.log(`[TH2b] QueryEligibleDevice queryId=${queryId} timeout — processing ${q.responses.length}/${q.expectedCount} responses`);
+    processQueryResult(q);
+  }, QUERY_TIMEOUT_MS);
+
+  pendingQueries.set(queryId, {
+    cid, ws, deviceId: p.deviceId,
+    sessionId: p.sessionId ?? null, batchId: p.batchId ?? null,
+    currentDeptId, remainingItems, allKhus,
+    expectedCount: queried,
+    responses: [],
+    timer,
+  });
+}
+
+/**
+ * EligibleDeviceResponse (C→S)
+ * Client responds to server's QueryEligibleDevice after running DK1/2/3.
+ */
+function onEligibleDeviceResponse(
+  cid: string,
+  p: EligibleDeviceResponsePayload
+): void {
+  const q = pendingQueries.get(p.queryId);
+  if (!q) {
+    console.log(`[TH2b] EligibleDeviceResponse: unknown queryId=${p.queryId} cid=${cid} — ignoring`);
+    return;
+  }
+
+  q.responses.push({ connectionId: cid, eligible: p.eligible, deviceId: p.deviceId });
+  console.log(
+    `[TH2b] EligibleDeviceResponse: cid=${cid} eligible=${p.eligible} device=${p.deviceId ?? "-"} ` +
+    `(${q.responses.length}/${q.expectedCount})`
+  );
+
+  // Process immediately if we have an eligible response OR all clients have responded
+  if (p.eligible || q.responses.length >= q.expectedCount) {
+    clearTimeout(q.timer);
+    pendingQueries.delete(p.queryId);
+    processQueryResult(q);
   }
 }
 
