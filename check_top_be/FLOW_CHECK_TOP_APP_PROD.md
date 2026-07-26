@@ -52,6 +52,7 @@
 | `retryMap` | `Map<cid, Map<requestId, retryCount>>` — theo dõi retry TH2a per connection |
 | `deviceWatchMap` | `Map<"cid:deviceId", setTimeout>` — watchdog 3 phút per device |
 | `recoveryMap` | `Map<"cid:deviceId", setTimeout>` — safety watchdog 60s TH2b |
+| `pendingQueries` | `Map<queryId, PendingQuery>` — collector cho QueryEligibleDevice round-trip (3s) |
 
 ---
 
@@ -397,10 +398,10 @@ App gửi ngay lập tức trước khi bắt đầu 30s recovery window nội b
 ### 3.10 `BatchDeviceError`
 
 **Khi nào:** App báo kết quả sau recovery window:
-- `REASSIGNED`: App tự tìm được thiết bị thay thế trong cùng pool
-- `NO_ELIGIBLE_DEVICE`: App không tìm được thiết bị nào, nhờ server xử lý
+- `REASSIGNED`: App tự tìm được thiết bị thay thế trong cùng pool (DK1/2/3 pass), **hoặc** sau khi nhận `ForceReassignDevice` từ server
+- `NO_ELIGIBLE_DEVICE`: App không tìm được thiết bị nào (DK1/2/3 fail hết), nhờ server xử lý
 
-**Format:** Non-standard.
+**Format — Case REASSIGNED:**
 
 ```json
 {
@@ -415,30 +416,116 @@ App gửi ngay lập tức trước khi bắt đầu 30s recovery window nội b
 }
 ```
 
+**Format — Case NO_ELIGIBLE_DEVICE:**
+
+```json
+{
+  "event": "BatchDeviceError",
+  "payload": {
+    "deviceId": "emulator-5554",
+    "sessionId": "sess-uuid-001",
+    "batchId": "batch-001",
+    "status": "NO_ELIGIBLE_DEVICE",
+    "currentDeptId": "dept-001",
+    "remainingItems": [
+      {
+        "requestId": "keyword|vn|proxy|uuid|dept-001|KHU%20A",
+        "keyword": "mua bán nhà",
+        "proxy": ["proxy-01"],
+        "country": 1,
+        "departmentId": "dept-001",
+        "departmentName": "KHU A",
+        "deviceId": null
+      }
+    ],
+    "allKhus": [
+      {
+        "departmentId": "dept-001",
+        "departmentName": "KHU A",
+        "items": [ /* tất cả KhuItem của khu này, kể cả đã hoàn thành */ ]
+      },
+      {
+        "departmentId": "dept-002",
+        "departmentName": "KHU B",
+        "items": [ /* tất cả KhuItem của khu pending */ ]
+      }
+    ]
+  }
+}
+```
+
+| Field | Mô tả |
+|---|---|
+| `currentDeptId` | departmentId của khu đang chạy dở |
+| `remainingItems` | Các keyword chưa chạy của **khu đang chạy** — dùng cho ForceReassignDevice (cùng PC) |
+| `allKhus` | **Toàn bộ** tất cả khu (current + pending), mỗi khu chứa full items — dùng cho cross-PC CheckKeywords |
+
+> **Tại sao phân biệt `remainingItems` vs `allKhus`?**
+> - Cùng PC (`ForceReassignDevice`): chỉ cần `remainingItems` của khu đang chạy dở. Các khu pending vẫn còn trong queue nội bộ của app.
+> - Khác PC (`CheckKeywords` cross-PC): cần `allKhus` FULL vì PC khác không có queue của PC này — phải chạy lại từ đầu.
+
 **Server xử lý:**
 - Cancel safety watchdog (`recoveryMap`)
 - Push log `batch_device_error`
 
 **Case `REASSIGNED`:**
-1. Mark device gốc → `offline` (không còn phục vụ job)
+1. Mark device gốc → `offline`
 2. Mark device mới → `processing` với `jobId/batchId` gốc
 3. Push log `takeover_reassigned` cho device mới
 
-**Case `NO_ELIGIBLE_DEVICE`:**
-
-Server tìm fallback theo thứ tự ưu tiên:
-
-| Ưu tiên | Điều kiện | Hành động |
-|---|---|---|
-| 1 | Idle device ở **pool khác** | Gửi `BatchReassignFallback` đến WS của pool kia |
-| 2 | Bất kỳ device non-offline trong **cùng pool** | Gửi `BatchReassignFallback + force:true` về pool hiện tại |
-| 3 | Không có device nào | Push alert `no_device_globally` lên dashboard |
-
-Với cả 3 case tìm được device: mark device gốc → `offline`, mark replacement → `processing`, push log `takeover_reassigned`.
+**Case `NO_ELIGIBLE_DEVICE` (xem chi tiết ở mục 8):**
+1. Mark device gốc → `offline` ngay lập tức
+2. Push log `th2b_no_eligible_device`
+3. Broadcast `QueryEligibleDevice` đến **tất cả** các client khác (trừ client báo lỗi)
+4. Thu thập `EligibleDeviceResponse` trong 3 giây
+5. Xử lý theo TH-A / TH-B1 / TH-B2 / Priority 3
 
 ---
 
-### 3.11 `device_fail_recovery_cancel`
+### 3.11 `EligibleDeviceResponse`
+
+**Khi nào:** Client trả lời sau khi nhận `QueryEligibleDevice` từ server.
+Client chạy DK1/2/3 trên tất cả thiết bị mình quản lý và báo kết quả.
+**Format:** Non-standard.
+
+```json
+{
+  "event": "EligibleDeviceResponse",
+  "payload": {
+    "queryId": "q_1700000000000_abc12",
+    "eligible": true,
+    "deviceId": "emulator-5556"
+  }
+}
+```
+
+| Field | Mô tả |
+|---|---|
+| `queryId` | Echo lại queryId từ `QueryEligibleDevice` |
+| `eligible` | `true` nếu có ít nhất 1 device pass DK1/2/3 |
+| `deviceId` | Serial của device eligible (nếu `eligible=true`) |
+
+**Logic DK1/2/3 tại client:**
+
+| Điều kiện | Công thức |
+|---|---|
+| **DK1** | `done_by_B >= floor(total_khu_B / 2)` AND không có khu khác đang chờ |
+| **DK2** | `total_khu_B <= 5` AND không có khu khác đang chờ |
+| **DK3** | `remaining_A <= 5` AND không có khu khác đang chờ |
+
+- `done_by_B` = số keyword device B đã hoàn thành thành công từ **khu hiện tại của B**
+- `total_khu_B` = tổng số keyword trong khu hiện tại của B
+- `remaining_A` = số keyword còn lại của device A bị fail (từ `remainingCount` trong QueryEligibleDevice)
+- Device idle → **luôn eligible** (total=0, done=0, không khu nào chờ)
+
+**Server xử lý:**
+- Tìm `pendingQuery` theo `queryId`
+- Thêm response vào danh sách
+- Nếu nhận được response `eligible=true` **HOẶC** tất cả client đã trả lời → fire `processQueryResult` ngay (không chờ timeout)
+
+---
+
+### 3.12 `device_fail_recovery_cancel`
 
 **Khi nào:** App tự xử lý xong recovery, cancel safety watchdog.
 **Format:** Non-standard.
@@ -486,8 +573,11 @@ Format: Non-standard `{ event, target, payload }`.
 
 ### 4.2 `BatchReassignFallback`
 
-**Khi nào:** TH2b — device fail, server dispatch job cho thiết bị thay thế.
+**Khi nào:** Watchdog timeout (device 3 phút hoặc recovery 60s) — server dispatch job cho thiết bị thay thế.
 Gửi đến WS của pool chứa thiết bị thay thế (có thể là pool khác).
+
+> **Lưu ý:** Event này chỉ còn dùng trong **watchdog path** (`fireDeviceTimeout`, `fireRecoveryFallback`).
+> Luồng TH2b chủ động từ app dùng `QueryEligibleDevice` / `ForceReassignDevice` / `CheckKeywords` mới.
 
 ```json
 {
@@ -514,6 +604,80 @@ Gửi đến WS của pool chứa thiết bị thay thế (có thể là pool kh
 | `reason` | `"device_timeout"` hoặc `"recovery_watchdog"` (nếu từ watchdog) |
 
 **App nhận:** Giao job `sessionId/batchId` cho `fallbackDeviceId`.
+
+---
+
+### 4.3 `QueryEligibleDevice`
+
+**Khi nào:** Server nhận `BatchDeviceError(NO_ELIGIBLE_DEVICE)` từ một client — broadcast đến **tất cả các client khác** để hỏi xem client nào có device đủ điều kiện.
+
+```json
+{
+  "event": "QueryEligibleDevice",
+  "target": "QueryEligibleDevice",
+  "payload": {
+    "queryId": "q_1700000000000_abc12",
+    "departmentId": "dept-001",
+    "remainingCount": 7,
+    "sessionId": "sess-uuid-001"
+  }
+}
+```
+
+| Field | Mô tả |
+|---|---|
+| `queryId` | UUID cho round-trip này — phải echo lại trong `EligibleDeviceResponse` |
+| `departmentId` | DepartmentId của khu cần xử lý |
+| `remainingCount` | Số keyword còn lại (`remaining_A` dùng cho DK3) |
+| `sessionId` | Lab session đang bị fail |
+
+**App nhận:** Chạy DK1/2/3 trên tất cả device đang quản lý → gửi `EligibleDeviceResponse` về server.
+
+**Server timeout:** 3 giây (`QUERY_TIMEOUT_MS`). Sau 3s chưa đủ response → `processQueryResult` với những gì đã nhận.
+
+---
+
+### 4.4 `ForceReassignDevice`
+
+**Khi nào:** TH-B1 — không client nào có device eligible (DK1/2/3 fail), nhưng pool gốc (pool của device bị fail) **vẫn còn device khác không offline**. Server yêu cầu client đó bắt buộc chọn device bất kỳ (bỏ qua DK).
+
+```json
+{
+  "event": "ForceReassignDevice",
+  "target": "ForceReassignDevice",
+  "payload": {
+    "queryId": "force_1700000000000",
+    "originalDeviceId": "emulator-5554",
+    "departmentId": "dept-001",
+    "departmentName": "KHU A",
+    "sessionId": "sess-uuid-001",
+    "batchId": "batch-001",
+    "remainingItems": [
+      {
+        "requestId": "keyword|vn|proxy|uuid|dept-001|KHU%20A",
+        "keyword": "mua bán nhà",
+        "proxy": ["proxy-01"],
+        "country": 1,
+        "departmentId": "dept-001",
+        "departmentName": "KHU A",
+        "deviceId": null
+      }
+    ]
+  }
+}
+```
+
+| Field | Mô tả |
+|---|---|
+| `queryId` | ID cho lần force này |
+| `originalDeviceId` | Device bị fail (cần reassign job của device này) |
+| `remainingItems` | **Chỉ** các keyword chưa chạy của khu đang dở — KHÔNG bao gồm khu pending (còn trong queue nội bộ của app) |
+| `departmentId` / `departmentName` | Khu đang dở |
+
+**App nhận:**
+1. Chọn device đầu tiên available (không phải `originalDeviceId`, không offline) — bỏ qua DK
+2. Reassign các queued job của `originalDeviceId` cho device đó
+3. Gửi `BatchDeviceError(REASSIGNED, deviceId_new=<force_serial>)` về server để server log + update state
 
 ---
 
@@ -760,78 +924,158 @@ App                         Server                       Dashboard
 
 **Điều kiện:** Thiết bị mất kết nối ADB trong khi đang chạy job.
 
-### 8.1 Luồng Option A — App xử lý được (REASSIGNED)
+### 8.1 DK1/2/3 — Điều kiện eligibility tại client
 
-App tìm được thiết bị thay thế trong cùng pool:
+Khi device A fail, app scan tất cả device còn lại trong pool và kiểm tra từng device B:
+
+| Điều kiện | Công thức | Ý nghĩa |
+|---|---|---|
+| **DK1** | `done_by_B >= floor(total_khu_B / 2)` AND `not other_khu_waiting` | B đã chạy xong hơn nửa khu → có thể nhận thêm |
+| **DK2** | `total_khu_B <= 5` AND `not other_khu_waiting` | Khu của B nhỏ → có thể nhận thêm |
+| **DK3** | `remaining_A <= 5` AND `not other_khu_waiting` | Số keyword A còn lại ít → không tốn nhiều B |
+
+- `done_by_B` = số keyword B đã **DONE** từ **khu hiện tại của B** (không phải khu của A)
+- `total_khu_B` = tổng keyword trong khu B đang chạy
+- `remaining_A` = số keyword A còn trong queue (chưa chạy)
+- `other_khu_waiting` = B còn khu khác đang chờ trong queue (có > 1 dept_id khác nhau)
+- Device **idle** (total=0) → **luôn eligible**
+
+Lấy device đầu tiên pass DK1 OR DK2 OR DK3.
+
+---
+
+### 8.2 Luồng TH1 — App tìm được device (REASSIGNED nội bộ)
 
 ```
-App                          Server                       Dashboard
+App (PC1)                    Server                       Dashboard
  │                              │                              │
- │  [Device bị rút]             │                              │
+ │  [Device A bị rút]           │                              │
  │──device_fail_recovery_start─►│                              │
  │   (windowMs=30000)           │──step_log (device_fail_recovery_start)►│
  │                              │  [Start safety watchdog 60s]
  │
  │  [App thử kết nối lại 30s]
- │  [Tìm được device mới]
+ │  [DK1/2/3: tìm được device B đủ điều kiện]
+ │  [Giao remainingItems của A cho B]
  │
  │──BatchDeviceError───────────►│
  │   status=REASSIGNED          │  [Cancel safety watchdog]
  │   deviceId_new=emulator-5556 │──step_log (batch_device_error)──────►│
- │                              │──device_update (Samsung → offline)──►│
- │                              │──device_update (W4WK → processing)──►│
- │                              │──step_log (takeover_reassigned W4WK)►│
+ │                              │──device_update (A → offline)────────►│
+ │                              │──device_update (B → processing)─────►│
+ │                              │──step_log (takeover_reassigned B)───►│
  │
- │  [W4WK tiếp tục chạy job của Samsung]
- │──step_change (deviceId=W4WK)►│
+ │  [B tiếp tục chạy job của A]
+ │──step_change (deviceId=B)───►│
  │──SubmitMobileResult─────────►│
  │──job_success────────────────►│
 ```
 
-### 8.2 Luồng Option B — App không tìm được thiết bị (NO_ELIGIBLE_DEVICE)
+---
+
+### 8.3 Luồng TH2 — App không tìm được device (NO_ELIGIBLE_DEVICE)
 
 ```
-App                          Server                       Dashboard
- │──BatchDeviceError───────────►│
- │   status=NO_ELIGIBLE_DEVICE  │  [Cancel safety watchdog]
+App (PC1)                    Server                       App (PC2, PC3, ...)    Dashboard
+ │                              │                              │                     │
+ │──BatchDeviceError───────────►│                              │                     │
+ │   status=NO_ELIGIBLE_DEVICE  │  [Cancel safety watchdog]   │                     │
+ │   remainingItems=[...]       │──device_update (A → offline)────────────────────►│
+ │   allKhus=[...]              │──step_log (th2b_no_eligible_device)─────────────►│
+ │                              │                              │                     │
+ │                              │──QueryEligibleDevice────────►│                     │
+ │                              │   queryId, remainingCount    │  [DK1/2/3 scan]     │
+ │                              │◄─EligibleDeviceResponse──────│                     │
+ │                              │   eligible=true, deviceId=X  │                     │
+ │                              │  (hoặc false nếu không có)   │                     │
+ │                              │                              │                     │
+ │                     [processQueryResult sau 3s timeout hoặc khi có đủ response]  │
+```
+
+**TH-A — Có eligible client (DK pass):**
+```
+Server                       App (PC2 — eligible)         Dashboard
+ │                              │                              │
+ │──CheckKeywords──────────────►│                              │
+ │   allKhus FULL               │──step_log (th2b_cross_pool_eligible PC2)►│
+ │  (PC1: step_log th2b_routed_cross_pool)                    │
+ │                              │  [PC2 chạy toàn bộ các khu]
+```
+
+**TH-B1 — Không eligible, pool gốc (PC1) còn device khác:**
+```
+Server                       App (PC1)                    Dashboard
+ │                              │                              │
+ │──ForceReassignDevice────────►│                              │
+ │   remainingItems của khu dở  │  [Chọn device bất kỳ]       │
+ │──step_log (th2b_force_reassign)───────────────────────────►│
+ │                              │──BatchDeviceError (REASSIGNED)►│
+ │                              │  [device_update, takeover]   │
+```
+
+**TH-B2 — Pool gốc (PC1) không còn device nào, nhưng pool khác có:**
+```
+Server                       App (PC2 — first pool with devices)  Dashboard
+ │                              │                                    │
+ │──CheckKeywords──────────────►│                                    │
+ │   allKhus FULL               │──step_log (th2b_cross_pool_force PC2)►│
+ │  (PC1: step_log th2b_routed_cross_pool_force)                    │
+ │                              │  [PC2 chạy toàn bộ các khu]
+```
+
+**Priority 3 — Không có device nào toàn hệ thống:**
+```
+Server                       Dashboard
  │                              │
- │                              │  [Tìm idle device pool khác]
- │                              │  [Tìm thấy: W4WK ở conn_2]
- │◄─BatchReassignFallback───────│ (gửi đến ws của conn_2)
- │   fallbackDeviceId=W4WK      │──device_update (Samsung → offline)──►│
- │   fallbackConnectionId=conn_2│──device_update (W4WK → processing)──►│
- │                              │──step_log (takeover_reassigned W4WK)►│
+ │──step_log (no_device_globally ALERT)────────────────────────►│
 ```
 
-### 8.3 Luồng Option C — Safety watchdog timeout (App crash / hang)
+---
+
+### 8.4 Luồng Safety watchdog timeout (App crash / hang)
 
 ```
-[60 giây trôi qua, không nhận được BatchDeviceError]
+[60 giây trôi qua sau device_fail_recovery_start, không nhận được BatchDeviceError]
 
 Server                       Dashboard
  │                              │
  │  [fireRecoveryFallback()]    │
  │──step_log (recovery_watchdog_timeout)►│
- │  [Tìm replacement...]        │
+ │  [Tìm replacement — ưu tiên idle pool khác → force cùng pool]
  │──device_update (original → offline)──►│
  │──device_update (fallback → processing)►│
  │──step_log (takeover_reassigned)──────►│
  │◄─BatchReassignFallback (gửi đến app của pool có fallback)
 ```
 
-### 8.4 Priority tìm fallback device
+---
+
+### 8.5 Tóm tắt routing NO_ELIGIBLE_DEVICE
 
 ```
-1. Idle device ở pool KHÁC (khác connectionId)
-   → Gửi BatchReassignFallback đến ws của pool đó
-   → Nếu ws pool đó không available → gửi về pool gốc
-
-2. Non-offline device ở CÙNG pool (force=true)
-   → Gửi BatchReassignFallback về pool gốc với force:true
-   → App phải dùng device này dù nó đang bận
-
-3. Không có device nào
-   → Push step_log "no_device_globally" (ALERT) lên dashboard
+BatchDeviceError(NO_ELIGIBLE_DEVICE)
+        │
+        ▼
+Mark device gốc → offline
+        │
+        ▼
+QueryEligibleDevice → tất cả client khác (3s timeout)
+        │
+        ├─ eligible response nhận được?
+        │      YES → TH-A: CheckKeywords(allKhus FULL) → eligible client
+        │
+        └─ NO eligible:
+               │
+               ├─ Pool gốc còn device khác?
+               │      YES → TH-B1: ForceReassignDevice(remainingItems) → pool gốc
+               │             App chọn device bất kỳ, gửi REASSIGNED lại
+               │
+               └─ Pool gốc trống:
+                      │
+                      ├─ Pool khác còn device?
+                      │      YES → TH-B2: CheckKeywords(allKhus FULL) → pool đó
+                      │
+                      └─ Không ai → ALERT: no_device_globally
 ```
 
 ---
@@ -871,6 +1115,17 @@ Server                       Dashboard
 
 ---
 
+### 9.3 QueryEligibleDevice Timeout (3 giây)
+
+**Key:** `queryId` trong `pendingQueries`
+**Timeout:** 3,000ms (`QUERY_TIMEOUT_MS`)
+**Start khi:** Server broadcast `QueryEligibleDevice`
+**Cancel khi:** Nhận đủ responses hoặc có response `eligible=true`
+
+**Khi timeout:** Gọi `processQueryResult` với những response đã nhận (có thể ít hơn số client được query).
+
+---
+
 ## 10. Toàn bộ step log names
 
 Step log có `step` là string tự do — dưới đây là tất cả các giá trị được emit:
@@ -891,14 +1146,19 @@ Server không validate, forward thẳng vào log.
 | `job_success` | `success` | `onJobSuccess` | Toàn bộ job thành công |
 | `job_failed` | `failed` | `onJobFailed` | Batch đóng với lỗi |
 | `recovering_done` | `success` | `onRecoveringDone` | Hardware recovery hoàn tất |
-| `batch_device_error` | `failed` | `onBatchDeviceError` | App báo TH2b với status |
-| `takeover_reassigned` | `running` | `onBatchDeviceError` / `fireRecoveryFallback` / `fireDeviceTimeout` | Device B đang chạy thay cho device A (log gắn vào device B) |
-| `batch_reassign_fallback_same_pool` | `running` | `onBatchDeviceError` (force same pool) | Fallback force về cùng pool |
 | `device_fail_recovery_start` | `running` | `onDeviceFailRecoveryStart` | App báo bắt đầu recovery window |
+| `batch_device_error` | `failed` | `onBatchDeviceError` | App báo TH2b với status |
+| `takeover_reassigned` | `running` | `onBatchDeviceError(REASSIGNED)` | Device B đang chạy thay cho device A |
+| `th2b_no_eligible_device` | `failed` | `onBatchDeviceError(NO_ELIGIBLE_DEVICE)` | Client không tìm được device — server xử lý |
+| `th2b_cross_pool_eligible` | `running` | `processQueryResult` TH-A | Server gửi CheckKeywords đến client eligible (DK pass) — log gắn vào **cid nhận** |
+| `th2b_routed_cross_pool` | `running` | `processQueryResult` TH-A | Keywords đã route sang pool khác — log gắn vào **cid gốc** |
+| `th2b_force_reassign` | `running` | `processQueryResult` TH-B1 | Server gửi ForceReassignDevice về cùng pool |
+| `th2b_cross_pool_force` | `running` | `processQueryResult` TH-B2 | Server gửi CheckKeywords đến pool khác (pool gốc hết device) — log gắn vào **cid nhận** |
+| `th2b_routed_cross_pool_force` | `running` | `processQueryResult` TH-B2 | Keywords đã route sang pool khác (B2) — log gắn vào **cid gốc** |
+| `no_device_globally` | `failed` | `processQueryResult` / `fireRecoveryFallback` | ALERT — không có device nào toàn hệ thống |
 | `recovery_watchdog_timeout` | `failed` | `fireRecoveryFallback` | Watchdog hết hạn, app không gửi BatchDeviceError |
 | `recovery_watchdog_reassigned` | `running` | `fireRecoveryFallback` (found) | Watchdog tìm được device cross-pool |
 | `recovery_watchdog_force_fallback` | `running` | `fireRecoveryFallback` (anyActive) | Watchdog force fallback cùng pool |
-| `no_device_globally` | `failed` | `onBatchDeviceError` / `fireRecoveryFallback` | ALERT — không có device nào toàn hệ thống |
 | `device_timeout` | `failed` | `fireDeviceTimeout` | Device không gửi step_change 3 phút |
 | `device_timeout_reassigned` | `failed` | `fireDeviceTimeout` (found) | Watchdog 3 phút tìm được replacement |
 | `device_timeout_no_replacement` | `failed` | `fireDeviceTimeout` (no fallback) | ALERT — 3 phút timeout, không có replacement |
@@ -947,6 +1207,23 @@ Device {
   retryCount: number       // TH2a retry count
   lastUpdated: number
 }
+
+// Module-level trong app-ws.ts (không phải trong Store)
+pendingQueries: Map<queryId, PendingQuery>   // TH2b QueryEligibleDevice collector
+
+PendingQuery {
+  cid:            string            // connectionId của client báo NO_ELIGIBLE_DEVICE
+  ws:             WSContext         // ws của client đó (dùng cho ForceReassignDevice)
+  deviceId:       string            // device bị fail
+  sessionId:      string | null
+  batchId:        string | null
+  currentDeptId:  string
+  remainingItems: KhuItem[]         // partial current khu (cho ForceReassignDevice)
+  allKhus:        KhuData[]         // full tất cả khu (cho cross-PC CheckKeywords)
+  expectedCount:  number            // số client đã được gửi QueryEligibleDevice
+  responses:      Array<{ connectionId, eligible, deviceId? }>
+  timer:          Timer             // 3s timeout handle
+}
 ```
 
 ### Ring buffer sizes
@@ -965,16 +1242,19 @@ Pool.nodeId  → PoolSerialized.machineId
 
 ---
 
-## Phụ lục — Ví dụ flow đầy đủ TH2b REASSIGNED
+## Phụ lục A — Ví dụ flow đầy đủ TH2b REASSIGNED (nội bộ)
 
 ```
-Timeline:
-  t=0s   Samsung chạy job KHU C, step_change liên tục
+Timeline (1 PC, 2 devices):
+  t=0s   Samsung chạy job KHU C (10 keyword), step_change liên tục
   t=30s  Samsung bị rút dây USB
   t=30s  App phát hiện ADB disconnect → gửi device_fail_recovery_start
   t=30s  Server start safety watchdog 60s
   t=35s  App thử kết nối lại Samsung → thất bại
-  t=40s  App tìm W4WK (idle, cùng pool) → giao job
+  t=40s  App scan DK1/2/3:
+           W4WK đang chạy KHU D (total=8, done=5, floor=4, done>=floor → DK1 pass)
+           Không có khu khác chờ → DK1 ELIGIBLE
+  t=40s  App giao remainingItems KHU C cho W4WK
   t=40s  App gửi BatchDeviceError {status: REASSIGNED, deviceId_new: W4WK}
   t=40s  Server:
            - Cancel safety watchdog
@@ -989,4 +1269,65 @@ Dashboard hiển thị:
   - Cột Samsung: status=OFFLINE, log step cuối là batch_device_error
   - Cột W4WK: "Chạy thay Samsung" card (orange) + log step từ t=41s
   - Session KHU C: kết quả đầy đủ từ cả Samsung + W4WK
+```
+
+---
+
+## Phụ lục B — Ví dụ flow TH2b NO_ELIGIBLE_DEVICE → TH-A (cross-PC)
+
+```
+Timeline (2 PC, mỗi PC 1 device, cả 2 đang bận):
+  t=0s   PC1/SamsungA chạy KHU C (10 kw), PC2/SamsungB chạy KHU D (3 kw)
+  t=30s  PC1/SamsungA bị rút dây
+  t=30s  PC1 gửi device_fail_recovery_start
+  t=30s  Server start safety watchdog 60s
+  t=35s  PC1 thử kết nối lại → thất bại
+  t=40s  PC1 scan DK1/2/3 (chỉ SamsungA trong pool — SamsungA là device fail → skip):
+           Không có device nào khác → NO_ELIGIBLE_DEVICE
+  t=40s  PC1 gửi BatchDeviceError {
+           status: NO_ELIGIBLE_DEVICE,
+           remainingItems: [7 keyword KHU C còn lại],
+           allKhus: [{ dept=KHU_C, items: all 10 keyword }]
+         }
+  t=40s  Server:
+           - Cancel safety watchdog
+           - Mark SamsungA → offline
+           - Push th2b_no_eligible_device
+           - Broadcast QueryEligibleDevice(remainingCount=7) → PC2
+  t=40s  PC2 nhận QueryEligibleDevice:
+           SamsungB đang chạy KHU D, total=3 → DK2 pass (total<=5)
+           Gửi EligibleDeviceResponse { eligible: true, deviceId: SamsungB }
+  t=40s  Server nhận eligible → processQueryResult TH-A ngay lập tức:
+           - Gửi CheckKeywords(allKhus=[KHU_C 10 keyword]) → PC2 device SamsungB
+           - Push th2b_cross_pool_eligible (cid=PC2, device=SamsungB)
+           - Push th2b_routed_cross_pool (cid=PC1, device=SamsungA)
+  t=41s+ PC2/SamsungB chạy toàn bộ KHU C (từ đầu, vì khác PC)
+  t=end  PC2 gửi job_success → SamsungB → idle
+
+Lưu ý: PC2 chạy lại toàn bộ KHU C từ keyword đầu tiên, không phải từ keyword 8
+(vì khác PC, không có queue state của PC1)
+```
+
+---
+
+## Phụ lục C — Ví dụ flow TH2b NO_ELIGIBLE_DEVICE → TH-B1 (ForceReassignDevice)
+
+```
+Timeline (1 PC, 2 devices đều bận, cả 2 DK fail):
+  t=0s   SamsungA chạy KHU C (10 kw), SamsungB chạy KHU D (10 kw) + KHU E pending
+  t=30s  SamsungA bị rút → NO_ELIGIBLE_DEVICE
+         (SamsungB: total=10, done=3, floor=5 → DK1 fail; total=10 → DK2 fail;
+                    remaining_A=7 → DK3 fail; other_khu_waiting=true vì có KHU E → fail)
+  t=40s  Server nhận NO_ELIGIBLE_DEVICE:
+           - QueryEligibleDevice → không có client nào khác (chỉ 1 PC)
+           - Hoặc PC2 không có device eligible
+           - processQueryResult TH-B1: pool gốc còn SamsungB (non-offline)
+           - Gửi ForceReassignDevice(remainingItems=[7 keyword KHU C]) → PC1
+  t=40s  PC1 nhận ForceReassignDevice:
+           - Chọn SamsungB (device đầu tiên không phải SamsungA, không offline)
+           - Giao 7 keyword KHU C cho SamsungB (queue nội bộ)
+           - Gửi BatchDeviceError { status: REASSIGNED, deviceId_new: SamsungB }
+  t=40s  Server: Mark SamsungA → offline, SamsungB → processing, push takeover_reassigned
+
+SamsungB tiếp tục:  KHU D đang dở → xong → KHU E pending → xong → 7 keyword KHU C → xong
 ```
