@@ -58,6 +58,9 @@ const DEVICE_POLL_INTERVAL_MS = 30_000;   // 30s — proactive device-status pol
 // TH2a: per-connection retry state — requestId → retryCount
 const retryMap = new Map<string, Map<string, number>>();
 
+// TH3: job_failed retry — sessionId → retryCount (max 1 retry per session)
+const jobFailedRetryMap = new Map<string, Map<string, number>>();
+
 // TH2b Option2: safety watchdog per device — server acts if app never sends BatchDeviceError
 // key = `${cid}:${deviceId}`, value = setTimeout handle
 const RECOVERY_WATCHDOG_MS = 60_000; // 60s — app has 30s window + time to send event
@@ -458,6 +461,7 @@ export function appWsHandlers() {
         if (pingTimer) clearInterval(pingTimer);
         if (pollTimer) clearInterval(pollTimer);
         retryMap.delete(connectionId);
+        jobFailedRetryMap.delete(connectionId);
         clearAllWatchdogsForCid(connectionId);
         clearAllRecoveryForCid(connectionId);
         clearTakeoverForCid(connectionId);
@@ -497,7 +501,7 @@ function handleEvent(
     case "job_success":
       return onJobSuccess(cid, payload as unknown as JobSuccessPayload);
     case "job_failed":
-      return onJobFailed(cid, payload as unknown as JobFailedPayload);
+      return onJobFailed(cid, ws, payload as unknown as JobFailedPayload);
     case "recovering_done":
       return onRecoveringDone(cid, payload as { deviceId: string });
     case "BatchDeviceError":
@@ -615,6 +619,7 @@ function onRegisterPool(
   }
 
   retryMap.set(cid, new Map());
+  jobFailedRetryMap.set(cid, new Map());
 
   const pool: Pool = {
     connectionId: cid,
@@ -713,6 +718,7 @@ function onStepChange(cid: string, p: StepChangePayload): void {
   // Remap to replacement device if TH2b takeover is active
   const resolved = resolveTakeover(cid, p.deviceId);
   resetDeviceWatchdog(resolved.cid, resolved.deviceId); // heartbeat for the actual running device
+  console.log(`[step_change] cid=${cid} device=${p.deviceId} batchId=${p.batchId ?? "-"} step="${p.currentStep ?? "-"}" kw="${p.keyword ?? "-"}"`);
   const { deptId } = parseReqIdDept(p.requestId);
   const detailParts = [
     p.keyword ? `kw="${p.keyword}"` : null,
@@ -900,7 +906,7 @@ function onJobSuccess(cid: string, p: JobSuccessPayload): void {
  * not the device hardware. The device is still operational and ready for new work.
  * Physical device failures are reported separately via device_status:"offline" / watchdog.
  */
-function onJobFailed(cid: string, p: JobFailedPayload): void {
+function onJobFailed(cid: string, ws: WSContext, p: JobFailedPayload): void {
   const resolved = resolveTakeover(cid, p.deviceId);
   // Clear takeover mapping for this original→replacement pair — job is done.
   takeoverMap.delete(`${cid}:${p.deviceId}`);
@@ -927,6 +933,46 @@ function onJobFailed(cid: string, p: JobFailedPayload): void {
     jobId: p.sessionId ?? null, batchId: p.batchId ?? null,
     step: "job_failed", status: "failed", detail: p.reason,
   });
+
+  // ── TH3: retry failed keywords (max 1 per session) ────────────────────────
+  // Only retry when: reason=keyword_failed, failedItems present, session known.
+  const sessionId  = p.sessionId ?? "";
+  const failedItems = p.failedItems ?? [];
+  if (
+    sessionId &&
+    failedItems.length > 0 &&
+    p.reason === "keyword_failed"
+  ) {
+    const sessRetries = jobFailedRetryMap.get(cid) ?? new Map<string, number>();
+    jobFailedRetryMap.set(cid, sessRetries);
+    const current = sessRetries.get(sessionId) ?? 0;
+
+    if (current < 1) {
+      sessRetries.set(sessionId, current + 1);
+      const retryCount = current + 1;
+
+      const frame = JSON.stringify({
+        event:   "RetryFailedKeywords",
+        target:  "RetryFailedKeywords",
+        payload: {
+          sessionId,
+          retryCount,
+          failedItems,
+        },
+      }) + "\u001e";
+      try { ws.send(frame); } catch { /* ignore */ }
+
+      store.pushLog({
+        ts: Date.now(), connectionId: cid, deviceId: p.deviceId,
+        jobId: sessionId, batchId: p.batchId ?? null,
+        step: "th3_retry", status: "running",
+        detail: `retry=${retryCount} failedItems=${failedItems.length}`,
+      });
+      console.log(`[job_failed] TH3 RetryFailedKeywords session=${sessionId} retry=${retryCount} items=${failedItems.length}`);
+    } else {
+      console.log(`[job_failed] TH3 max retry reached session=${sessionId} — not retrying`);
+    }
+  }
 }
 
 /**

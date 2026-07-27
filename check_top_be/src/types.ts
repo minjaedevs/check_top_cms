@@ -229,6 +229,8 @@ export interface JobFailedPayload {
   sessionId?: string;
   batchId?: string;
   reason?: string;          // "keyword_failed" | "device_not_found" | "missing_full_video" | "hls_failed"
+  /** Failed keyword details for TH3 server-triggered retry. */
+  failedItems?: Array<{ requestId: string; keyword: string }>;
 }
 
 /**
