@@ -231,6 +231,8 @@ export interface JobFailedPayload {
   reason?: string;          // "keyword_failed" | "device_not_found" | "missing_full_video" | "hls_failed"
   /** Failed keyword details for TH3 server-triggered retry. */
   failedItems?: Array<{ requestId: string; keyword: string }>;
+  /** True when this job_failed is from a TH3 retry that also failed — monitor only, no further retry. */
+  isRetryFail?: boolean;
 }
 
 /**

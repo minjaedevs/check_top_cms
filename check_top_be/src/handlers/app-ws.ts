@@ -936,8 +936,19 @@ function onJobFailed(cid: string, ws: WSContext, p: JobFailedPayload): void {
 
   // ── TH3: retry failed keywords (max 1 per session) ────────────────────────
   // Only retry when: reason=keyword_failed, failedItems present, session known.
-  const sessionId  = p.sessionId ?? "";
+  // isRetryFail=true means TH3 retry also failed — log only, no further retry.
+  const sessionId   = p.sessionId ?? "";
   const failedItems = p.failedItems ?? [];
+  if (p.isRetryFail) {
+    store.pushLog({
+      ts: Date.now(), connectionId: cid, deviceId: p.deviceId,
+      jobId: sessionId || null, batchId: p.batchId ?? null,
+      step: "th3_retry_failed", status: "failed",
+      detail: `retry also failed — items=${failedItems.length}`,
+    });
+    console.log(`[job_failed] TH3 retry also failed session=${sessionId} items=${failedItems.length} — no further retry`);
+    return;
+  }
   if (
     sessionId &&
     failedItems.length > 0 &&
