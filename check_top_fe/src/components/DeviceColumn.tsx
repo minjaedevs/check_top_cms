@@ -79,13 +79,20 @@ function buildGroups(logs: StepLog[]): LogGroup[] {
 
 /**
  * Filter logs that belong to a session (dual-discriminator: batchId + dept tag).
+ *
+ * Match order:
+ *  1. batchId exact match → include immediately (most precise)
+ *  2. batchId set but mismatches → fall through to dept-tag (handles SESS-LAB-* from Python)
+ *  3. batchId null/"" → dept-tag fallback
  */
 function sessionLogs(allLogs: StepLog[], sess: SessionRecord): StepLog[] {
   const end = sess.finishedAt ?? Infinity;
   return allLogs.filter((l) => {
     if (l.deviceId !== sess.deviceId) return false;
     if (l.ts < sess.sentAt - 2000 || l.ts > end + 5000) return false;
-    if (l.batchId != null) return l.batchId === sess.sessionId;
+    // Primary discriminator: batchId exact match
+    if (l.batchId && l.batchId === sess.sessionId) return true;
+    // Secondary discriminator: dept-tag (handles missing/mismatched batchId)
     const deptTag = l.detail?.match(/dept=([0-9a-f-]+)/i)?.[1];
     if (deptTag && deptTag !== sess.deptId) return false;
     return true;

@@ -729,7 +729,7 @@ function onStepChange(cid: string, p: StepChangePayload): void {
     connectionId: resolved.cid,
     deviceId: resolved.deviceId,
     jobId: p.requestId ?? p.sessionId ?? null,
-    batchId: p.batchId ?? null,
+    batchId: p.batchId || null,
     step: p.currentStep,
     status: "running",
     detail: detailParts.length ? detailParts.join(" ") : undefined,
