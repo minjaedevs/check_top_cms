@@ -11,9 +11,9 @@ import type {
   DashboardMessage,
 } from "./types";
 
-const LOG_RING_SIZE = 500;
+const LOG_RING_SIZE = 1000;
 const RESULT_RING_SIZE = 500;
-const DASH_RING_SIZE = 200; // sent in snapshot
+const DASH_RING_SIZE = 500; // sent in snapshot
 
 class Store {
   pools = new Map<string, Pool>();       // connectionId → Pool

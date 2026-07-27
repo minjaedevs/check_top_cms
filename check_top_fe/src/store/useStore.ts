@@ -11,8 +11,8 @@ import type {
   SessionRecord,
 } from "../types";
 
-const MAX_LOGS    = 200;
-const MAX_RESULTS = 200;
+const MAX_LOGS    = 1000;
+const MAX_RESULTS = 500;
 const MAX_SESSIONS = 50;
 
 // Step names that finalize a session
